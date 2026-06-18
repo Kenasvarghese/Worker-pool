@@ -18,11 +18,11 @@ import (
 
 // Func represents a unit of work that accepts arguments and returns an error.
 // It does not produce a result.
-type Func[PoolArgs any] func(args PoolArgs) error
+type Func[PoolArgs any] func(id string, args PoolArgs) error
 
 // FuncWithResult represents a unit of work that accepts arguments and returns
 // a result along with an error.
-type FuncWithResult[PoolArgs, PoolResult any] func(args PoolArgs) (PoolResult, error)
+type FuncWithResult[PoolArgs, PoolResult any] func(id string, args PoolArgs) (PoolResult, error)
 
 // Job represents a unit of work executed by a worker.
 // Implementations must be safe to call from a worker goroutine.
@@ -34,36 +34,37 @@ type Job interface {
 // result channel.
 //
 // IMPORTANT:
-//   - ResultChan is owned by the caller.
-//   - jobWithResult MUST NOT close ResultChan, as multiple jobs may share it.
+//   - resultChan is owned by the caller.
+//   - jobWithResult MUST NOT close resultChan, as multiple jobs may share it.
 //   - Errors are reported by logging; no value is sent on error.
 type jobWithResult[PoolArgs, PoolResult any] struct {
-	ResultChan chan PoolResult
-	Args       PoolArgs
-	Fn         FuncWithResult[PoolArgs, PoolResult]
+	id         string
+	resultChan chan PoolResult
+	args       PoolArgs
+	fn         FuncWithResult[PoolArgs, PoolResult]
 }
 
 // Run executes the job function and sends the result to the result channel.
 // If the function returns an error, it is logged and no result is sent.
 func (j *jobWithResult[PoolArgs, PoolResult]) Run() {
-	defer close(j.ResultChan)
-	result, err := j.Fn(j.Args)
+	result, err := j.fn(j.id, j.args)
 	if err != nil {
 		fmt.Println("error running job", err)
 		return
 	}
-	j.ResultChan <- result
+	j.resultChan <- result
 }
 
 // job is a Job that executes a function without producing a result.
 type job[PoolArgs any] struct {
-	Args PoolArgs
-	Fn   Func[PoolArgs]
+	id   string
+	args PoolArgs
+	fn   Func[PoolArgs]
 }
 
 // Run executes the job function and logs any returned error.
 func (j *job[PoolArgs]) Run() {
-	if err := j.Fn(j.Args); err != nil {
+	if err := j.fn(j.id, j.args); err != nil {
 		fmt.Println("error running job", err)
 	}
 }
@@ -71,13 +72,13 @@ func (j *job[PoolArgs]) Run() {
 // worker executes jobs received from the shared job channel.
 // A worker runs until the job channel is closed.
 type worker struct {
-	ID         int
-	JobChannel chan Job
+	id         int
+	jobChannel chan Job
 }
 
 // Start begins the worker loop. It blocks until the job channel is closed.
 func (w *worker) Start() {
-	for job := range w.JobChannel {
+	for job := range w.jobChannel {
 		job.Run()
 	}
 }
@@ -96,15 +97,18 @@ func (p *Pool) AddJob(ctx context.Context, job Job) {
 
 // Close closes the job channel, signaling all workers to exit once
 // all queued jobs have been processed.
+// It also waits for all workers to finish
 func (p *Pool) Close() {
 	p.closeOnce.Do(func() {
 		close(p.jobChannel)
 	})
+	p.wt.Wait()
 }
 
 // Pool manages a fixed number of worker goroutines consuming jobs from a shared queue.
 // The pool is intentionally untyped to allow heterogeneous jobs to be executed.
 type Pool struct {
+	wt         sync.WaitGroup
 	closeOnce  sync.Once
 	jobChannel chan Job
 }
@@ -113,14 +117,16 @@ type Pool struct {
 // Workers start immediately and block waiting for jobs.
 func NewPool(workerCount int, jobQueueSize int) *Pool {
 	p := &Pool{
+		wt:         sync.WaitGroup{},
 		jobChannel: make(chan Job, jobQueueSize),
 	}
+
 	for i := range workerCount {
 		worker := &worker{
-			ID:         i + 1,
-			JobChannel: p.jobChannel,
+			id:         i + 1,
+			jobChannel: p.jobChannel,
 		}
-		go worker.Start()
+		p.wt.Go(worker.Start)
 	}
 	return p
 }
@@ -128,8 +134,8 @@ func NewPool(workerCount int, jobQueueSize int) *Pool {
 // NewJob wraps a function without a return value into a Job.
 func NewJob[PoolArgs any](fn Func[PoolArgs], args PoolArgs) Job {
 	return &job[PoolArgs]{
-		Args: args,
-		Fn:   fn,
+		args: args,
+		fn:   fn,
 	}
 }
 
@@ -137,8 +143,8 @@ func NewJob[PoolArgs any](fn Func[PoolArgs], args PoolArgs) Job {
 // The result channel is owned by the caller and may be shared across jobs.
 func NewJobWithResult[PoolArgs, PoolResult any](fn FuncWithResult[PoolArgs, PoolResult], args PoolArgs, resultChan chan PoolResult) Job {
 	return &jobWithResult[PoolArgs, PoolResult]{
-		Args:       args,
-		Fn:         fn,
-		ResultChan: resultChan,
+		args:       args,
+		fn:         fn,
+		resultChan: resultChan,
 	}
 }

@@ -88,6 +88,8 @@ func (w *worker) Start() {
 // This call may block if the job queue is full.
 func (p *Pool) AddJob(ctx context.Context, job Job) {
 	select {
+	case <-p.ctx.Done():
+		return
 	case <-ctx.Done():
 		return
 	case p.jobChannel <- job:
@@ -100,14 +102,20 @@ func (p *Pool) AddJob(ctx context.Context, job Job) {
 // It also waits for all workers to finish
 func (p *Pool) Close() {
 	p.closeOnce.Do(func() {
+		// Canceling the context will cause AddJob to return
+		p.cancel()
+		// Closing the job channel will cause workers to exit
 		close(p.jobChannel)
 	})
+	// Wait for all workers to finish
 	p.wt.Wait()
 }
 
 // Pool manages a fixed number of worker goroutines consuming jobs from a shared queue.
 // The pool is intentionally untyped to allow heterogeneous jobs to be executed.
 type Pool struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
 	wt         sync.WaitGroup
 	closeOnce  sync.Once
 	jobChannel chan Job
@@ -116,7 +124,10 @@ type Pool struct {
 // NewPool creates a worker pool with the specified number of workers and job queue size.
 // Workers start immediately and block waiting for jobs.
 func NewPool(workerCount int, jobQueueSize int) *Pool {
+	ctx, cancel := context.WithCancel(context.Background())
 	p := &Pool{
+		ctx:        ctx,
+		cancel:     cancel,
 		wt:         sync.WaitGroup{},
 		jobChannel: make(chan Job, jobQueueSize),
 	}
